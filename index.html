@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -1366,6 +1365,7 @@
           </div>
           <div class="actions">
             <button class="btn btn-accent" id="btn-sortear">🎯 ¡Sortear ahora!</button>
+            <button class="btn btn-outline" id="btn-refrescar-sheets-pool" type="button" style="display:none;">🔄 Actualizar desde Sheets</button>
             <button class="btn btn-outline" id="btn-volver-eleccion">‹ Cambiar origen</button>
           </div>
         </div>
@@ -1384,6 +1384,7 @@
         <div class="actions">
           <button class="btn btn-accent" id="btn-sortear-de-nuevo">🔄 Volver a sortear</button>
           <button class="btn btn-primary" id="btn-guardar-combinado">💾 Guardar todo en el historial</button>
+          <button class="btn btn-outline btn-sm" id="btn-descartar-sesion" type="button">🗑️ Descartar borrador</button>
         </div>
       </div>
     </section>
@@ -1456,7 +1457,61 @@
     // Sorteos realizados en esta sesión, que se van acumulando en pantalla
     // hasta que se guardan (o se descartan) explícitamente. Sortear de nuevo
     // no borra los anteriores.
+    // Se persisten en localStorage como borrador para sobrevivir a F5.
     let sorteosSesion = [];
+
+    const KEY_SESION_DRAFT = 'sorteos_sesion_borrador';
+
+    function saveSesionDraft() {
+      try {
+        // Solo guardamos borrador si hay algo que no esté ya guardado en historial
+        const pendientes = sorteosSesion.filter(s => !s.guardado);
+        if (!pendientes.length && !sorteoPool.length) {
+          localStorage.removeItem(KEY_SESION_DRAFT);
+          return;
+        }
+        const payload = {
+          version: 1,
+          savedAt: new Date().toISOString(),
+          sorteosSesion,
+          sorteoPool,
+          sorteoOrigen
+        };
+        localStorage.setItem(KEY_SESION_DRAFT, JSON.stringify(payload));
+      } catch (e) {
+        // Quota o modo privado: no bloqueamos el flujo
+        console.warn('No se pudo guardar el borrador de sesión', e);
+      }
+    }
+
+    function loadSesionDraft() {
+      try {
+        const raw = localStorage.getItem(KEY_SESION_DRAFT);
+        if (!raw) return false;
+        const data = JSON.parse(raw);
+        if (!data || !Array.isArray(data.sorteosSesion)) return false;
+
+        const pendientes = data.sorteosSesion.filter(s => !s.guardado);
+        if (!pendientes.length && !(data.sorteoPool && data.sorteoPool.length)) {
+          localStorage.removeItem(KEY_SESION_DRAFT);
+          return false;
+        }
+
+        sorteosSesion = data.sorteosSesion || [];
+        sorteoPool = Array.isArray(data.sorteoPool) ? data.sorteoPool : [];
+        sorteoOrigen = data.sorteoOrigen || null;
+        return sorteosSesion.length > 0 || sorteoPool.length > 0;
+      } catch (e) {
+        console.warn('No se pudo leer el borrador de sesión', e);
+        return false;
+      }
+    }
+
+    function clearSesionDraft() {
+      try {
+        localStorage.removeItem(KEY_SESION_DRAFT);
+      } catch (e) {}
+    }
 
     // ============================================================
     // BACKEND: Google Apps Script (porque esta app corre en GitHub Pages,
@@ -2093,12 +2148,17 @@
       sorteoOrigen = 'formulario';
       sorteoPool = [...state.participantes];
       document.getElementById('sorteo-origen-label').textContent = 'participantes del formulario';
+      const btnRefresh = document.getElementById('btn-refrescar-sheets-pool');
+      if (btnRefresh) btnRefresh.style.display = 'none';
       updateSorteoConfigCount();
+      saveSesionDraft();
       showSorteoStep('config');
     });
 
     document.getElementById('btn-origen-archivo').addEventListener('click', () => {
       sorteoOrigen = 'archivo';
+      const btnRefresh = document.getElementById('btn-refrescar-sheets-pool');
+      if (btnRefresh) btnRefresh.style.display = 'none';
       showSorteoStep('archivo');
     });
 
@@ -2219,7 +2279,10 @@
         sorteoOrigen = 'sheets';
         sorteoPool = normalizados;
         document.getElementById('sorteo-origen-label').textContent = 'la hoja de Google Sheets conectada';
+        const btnRefresh = document.getElementById('btn-refrescar-sheets-pool');
+        if (btnRefresh) btnRefresh.style.display = 'inline-flex';
         updateSorteoConfigCount();
+        saveSesionDraft();
         showSorteoStep('config');
 
         const conEscuela = normalizados.filter(p => p.escuela).length;
@@ -2234,6 +2297,39 @@
         return true;
       } catch (err) {
         toast('No se pudo cargar la hoja: ' + err.message, 'error');
+        return false;
+      }
+    }
+
+    // Relee la hoja de Google Sheets y actualiza sorteoPool sin salir del paso de config.
+    // Conserva la exclusión de ganadores de esta sesión por DNI (no por id temporal).
+    async function refreshSorteoPoolFromSheets(silent) {
+      const cfg = await fetchSheetsConfig();
+      if (!cfg) {
+        toast('No hay una hoja de Sheets conectada', 'error');
+        return false;
+      }
+      try {
+        if (!silent) toast('Actualizando participantes desde Google Sheets...');
+        const rawRows = await loadSheetsCsvRows(cfg);
+        const normalizados = normalizarListaSheets(rawRows);
+        if (!normalizados.length) {
+          toast('La hoja no tiene participantes válidos', 'error');
+          return false;
+        }
+        sorteoOrigen = 'sheets';
+        sorteoPool = normalizados;
+        document.getElementById('sorteo-origen-label').textContent = 'la hoja de Google Sheets conectada';
+        const btnRefresh = document.getElementById('btn-refrescar-sheets-pool');
+        if (btnRefresh) btnRefresh.style.display = 'inline-flex';
+        updateSorteoConfigCount();
+        saveSesionDraft();
+        if (!silent) {
+          toast(`Lista actualizada: ${normalizados.length} participantes desde Sheets`, 'success');
+        }
+        return true;
+      } catch (err) {
+        toast('No se pudo actualizar la hoja: ' + err.message, 'error');
         return false;
       }
     }
@@ -2288,9 +2384,13 @@
             toast('El archivo no tiene participantes válidos', 'error');
             return;
           }
+          sorteoOrigen = 'archivo';
           sorteoPool = normalizados;
           document.getElementById('sorteo-origen-label').textContent = 'la base de datos importada';
+          const btnRefresh = document.getElementById('btn-refrescar-sheets-pool');
+          if (btnRefresh) btnRefresh.style.display = 'none';
           updateSorteoConfigCount();
+          saveSesionDraft();
           showSorteoStep('config');
           toast(`Cargados ${normalizados.length} participantes desde el archivo`, 'success');
         } catch (err) {
@@ -2301,12 +2401,22 @@
     }
 
     // Devuelve el pool sin las personas que ya ganaron en algún sorteo previo
-    // de esta sesión, para que nadie pueda salir sorteado dos veces al usar
-    // "Sortear de nuevo" con el mismo grupo.
+    // de esta sesión. Se excluye por DNI (estable) y, si no hay DNI, por id.
+    // Así sigue funcionando aunque se recargue el pool desde Sheets (que
+    // genera ids nuevos cada vez).
     function poolDisponible() {
+      const yaGanaronDnis = new Set();
       const yaGanaronIds = new Set();
-      sorteosSesion.forEach(s => s.ganadores.forEach(g => yaGanaronIds.add(g.id)));
-      return sorteoPool.filter(p => !yaGanaronIds.has(p.id));
+      sorteosSesion.forEach(s => s.ganadores.forEach(g => {
+        const dni = (g.dni || '').toString().trim();
+        if (dni) yaGanaronDnis.add(dni);
+        else if (g.id) yaGanaronIds.add(g.id);
+      }));
+      return sorteoPool.filter(p => {
+        const dni = (p.dni || '').toString().trim();
+        if (dni) return !yaGanaronDnis.has(dni);
+        return !yaGanaronIds.has(p.id);
+      });
     }
 
     function updateSorteoConfigCount() {
@@ -2327,16 +2437,31 @@
       }
     }
 
-    document.getElementById('btn-sortear').addEventListener('click', () => {
+    document.getElementById('btn-sortear').addEventListener('click', async () => {
+      const btn = document.getElementById('btn-sortear');
+      btn.disabled = true;
+
+      // Si el origen es Google Sheets, re-leemos la hoja justo antes de sortear
+      // para incluir a quien se haya anotado después de la última carga.
+      if (sorteoOrigen === 'sheets') {
+        const ok = await refreshSorteoPoolFromSheets(true);
+        if (!ok) {
+          btn.disabled = false;
+          return;
+        }
+      }
+
       const n = parseInt(document.getElementById('sorteo-cantidad').value, 10) || 1;
       const disponibles = poolDisponible();
 
       if (!disponibles.length) {
         toast('No quedan participantes disponibles: todos ya ganaron antes en esta sesión', 'error');
+        btn.disabled = false;
         return;
       }
       if (n < 1 || n > disponibles.length) {
         toast('Cantidad de ganadores inválida', 'error');
+        btn.disabled = false;
         return;
       }
 
@@ -2361,8 +2486,17 @@
 
       animarSorteo(disponibles, ganadores, () => {
         sorteosSesion.unshift(nuevoSorteo);
+        saveSesionDraft();
         renderSorteosSesion(true);
+        btn.disabled = false;
       });
+    });
+
+    document.getElementById('btn-refrescar-sheets-pool').addEventListener('click', async () => {
+      const btn = document.getElementById('btn-refrescar-sheets-pool');
+      btn.disabled = true;
+      await refreshSorteoPoolFromSheets(false);
+      btn.disabled = false;
     });
 
 
@@ -2575,7 +2709,15 @@
         await saveHistorial();
 
         sorteosSesion.forEach(s => { s.guardado = true; });
+        // Ya están en el historial compartido: limpiamos el borrador local
+        sorteosSesion = [];
+        sorteoPool = [];
+        sorteoOrigen = null;
+        clearSesionDraft();
         renderSorteosSesion();
+        showSorteoStep('inicio');
+        const btnRefresh = document.getElementById('btn-refrescar-sheets-pool');
+        if (btnRefresh) btnRefresh.style.display = 'none';
 
         closeModal();
         toast('Sorteo combinado guardado en el historial', 'success');
@@ -2583,13 +2725,26 @@
       document.getElementById('modal-cancel').onclick = closeModal;
     });
 
-    // Vuelve a sortear con el mismo grupo de participantes (formulario, archivo
-    // o Sheets ya cargado), sin borrar los sorteos anteriores de esta sesión ni
-    // pedir de nuevo el link de Sheets.
-    document.getElementById('btn-sortear-de-nuevo').addEventListener('click', () => {
-      updateSorteoConfigCount();
+    // Vuelve a sortear. Si el origen es Sheets, relee la hoja para incluir
+    // a quienes se hayan sumado después del sorteo anterior. No borra los
+    // resultados de esta sesión ni pide de nuevo el link.
+    document.getElementById('btn-sortear-de-nuevo').addEventListener('click', async () => {
+      const btn = document.getElementById('btn-sortear-de-nuevo');
+      btn.disabled = true;
+
+      if (sorteoOrigen === 'sheets') {
+        await refreshSorteoPoolFromSheets(true);
+      } else if (sorteoOrigen === 'formulario') {
+        await fetchParticipantes();
+        sorteoPool = [...state.participantes];
+        updateSorteoConfigCount();
+      } else {
+        updateSorteoConfigCount();
+      }
+
       showSorteoStep('config');
       document.getElementById('sorteo-step-config').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      btn.disabled = false;
     });
 
     // ========== HISTORIAL (admin) ==========
@@ -2790,6 +2945,20 @@
       if (e.target === document.getElementById('modal')) closeModal();
     });
 
+    document.getElementById('btn-descartar-sesion').addEventListener('click', () => {
+      if (!sorteosSesion.length && !sorteoPool.length) return;
+      if (!confirm('¿Descartar los sorteos de esta sesión que todavía no se guardaron en el historial? Esta acción no se puede deshacer.')) return;
+      sorteosSesion = [];
+      sorteoPool = [];
+      sorteoOrigen = null;
+      clearSesionDraft();
+      renderSorteosSesion();
+      showSorteoStep('inicio');
+      const btnRefresh = document.getElementById('btn-refrescar-sheets-pool');
+      if (btnRefresh) btnRefresh.style.display = 'none';
+      toast('Borrador de sesión descartado');
+    });
+
     // ========== MICRO-INTERACTIONS (ripple) ==========
     document.addEventListener('pointerdown', e => {
       const btn = e.target.closest('.btn');
@@ -2803,6 +2972,19 @@
 
     // ========== INICIO ==========
     checkAdminSession();
+
+    // Recuperar sorteos de la sesión si el usuario recargó la página (F5)
+    // antes de guardar en el historial.
+    if (loadSesionDraft()) {
+      const pendientes = sorteosSesion.filter(s => !s.guardado).length;
+      if (pendientes > 0) {
+        toast(`Se recuperaron ${pendientes} sorteo(s) de esta sesión (no guardados aún)`, 'success');
+      }
+      // Si hay admin activo y había borrador, mostramos resultados al entrar a Sortear
+      if (isAdmin && sorteosSesion.length) {
+        renderSorteosSesion();
+      }
+    }
   </script>
 </body>
 </html>
